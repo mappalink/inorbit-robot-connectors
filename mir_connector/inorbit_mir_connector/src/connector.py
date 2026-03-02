@@ -361,6 +361,15 @@ class MirConnector(Connector):
         }
         self.publish_pose(**pose_data)
 
+        # Keep the mission executor aware of the current native map frame
+        if (
+            self.mission_executor.is_initialized()
+            and self.mission_executor._worker_pool is not None
+        ):
+            self.mission_executor._worker_pool.set_native_map_id(
+                self.status.get("map_id", "")
+            )
+
         # publish odometry
         self.publish_odometry(
             linear_speed=self.status.get("velocity", {}).get("linear", 0),
