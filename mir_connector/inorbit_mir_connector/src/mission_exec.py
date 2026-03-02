@@ -81,9 +81,6 @@ class MirRobotApi(RobotApi):
         self._logger = logging.getLogger(self.__class__.__name__)
 
     async def evaluate_expression(self, expression: str):
-        self._logger.info(
-            f"evaluate_expression called, native_map_id={self._native_map_id!r}"
-        )
         m = _POSE_EXPR_RE.search(expression)
         if not m or m.group("frame_id") != self._native_map_id:
             # Not a native-frame pose expression — use the server eval.
@@ -154,10 +151,6 @@ class MirWorkerPool(WorkerPool):
         """Inject MirRobotApiFactory so WaitExpressions for native-frame
         waypoints are evaluated locally against the MiR's own pose."""
         super().prepare_builder_context(context, mission)
-        self.logger.info(
-            f"prepare_builder_context: native_map_id={self._native_map_id!r}, "
-            f"mission={mission.id}"
-        )
         if self._native_map_id:
             factory = MirRobotApiFactory(
                 self._api,
