@@ -103,6 +103,12 @@ class MirConnector(Connector):
             enable_io_mission_tracking=True,
         )
 
+        # Set up temporary mission groups
+        if config.connector_config.enable_temporary_mission_group:
+            self.mission_group = TmpMissionsGroupHandler(mir_api=self.mir_api)
+        else:
+            self.mission_group = NullMissionsGroupHandler()
+
         # Set up InOrbit Edge Executor for mission execution
         self.mission_executor: MirMissionExecutor = MirMissionExecutor(
             robot_id=robot_id,
@@ -112,13 +118,10 @@ class MirConnector(Connector):
             ),
             mir_api=self.mir_api,
             database_file=config.connector_config.mission_database_file,
+            missions_group=self.mission_group,
+            firmware_version=config.connector_config.mir_firmware_version,
+            connector_type=config.connector_type,
         )
-
-        # Set up temporary mission groups
-        if config.connector_config.enable_temporary_mission_group:
-            self.mission_group = TmpMissionsGroupHandler(mir_api=self.mir_api)
-        else:
-            self.mission_group = NullMissionsGroupHandler()
 
         # Initialize status as None to prevent publishing before the robot is connected
         self.status = None

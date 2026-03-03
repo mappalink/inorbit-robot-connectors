@@ -7,6 +7,7 @@ import math
 import json
 import re
 from enum import Enum
+from typing import Optional
 
 from inorbit_connector.connector import CommandResultCode
 from inorbit_edge_executor.datatypes import MissionRuntimeOptions, Robot
@@ -16,12 +17,14 @@ from inorbit_edge_executor.worker_pool import WorkerPool
 from inorbit_edge_executor.db import get_db
 from .mir_api import MirApiV2
 from .mir_api import SetStateId
+from .mission.translator import InOrbitToMirTranslator, SpatialTransform, fetch_spatial_transform
+from .mission.datatypes import MirInOrbitMission
+from .mission.behavior_tree import MirBehaviorTreeBuilderContext
+from .mission.tree_builder import MirTreeBuilder
+from .mir_api.missions_group import MirMissionsGroupHandler
 
 # Edge-mission execution module for MiR robots. It extends the inorbit-edge-executor module for
 # translating missions into MiR language and executing them.
-# TODO(b-Tomas): Impleemnt proper translation from InOrbit mission definitions into multi-step
-# MiR missions.
-#   - So far, this implements native pause/resume/abort methods for MiR missions.
 
 
 class MissionScriptName(Enum):
@@ -136,15 +139,40 @@ class MirRobotApiFactory(RobotApiFactory):
 
 class MirWorkerPool(WorkerPool):
 
-    def __init__(self, mir_api: MirApiV2, *args, **kwargs):
+    def __init__(
+        self,
+        mir_api: MirApiV2,
+        *args,
+        missions_group: Optional[MirMissionsGroupHandler] = None,
+        firmware_version: str = "v3",
+        connector_type: str = "",
+        **kwargs,
+    ):
         self.mir_api = mir_api
-        super().__init__(*args, **kwargs)
+        self._missions_group = missions_group
+        self._firmware_version = firmware_version
+        self._connector_type = connector_type
+        super().__init__(behavior_tree_builder=MirTreeBuilder(), *args, **kwargs)
         self.logger = logging.getLogger(name=self.__class__.__name__)
         self._native_map_id = ""
+        self._prefetched_transform: Optional[SpatialTransform] = None
 
     def set_native_map_id(self, map_id: str):
         """Set the native map ID from the connector's status polling."""
         self._native_map_id = map_id
+
+    # @override
+    def create_builder_context(self) -> MirBehaviorTreeBuilderContext:
+        """Create MiR-specific builder context with mission group and firmware info."""
+        missions_group_id = None
+        if self._missions_group is not None:
+            missions_group_id = self._missions_group.missions_group_id
+        return MirBehaviorTreeBuilderContext(
+            mir_api=self.mir_api,
+            missions_group_id=missions_group_id,
+            firmware_version=self._firmware_version,
+            connector_type=self._connector_type,
+        )
 
     # @override
     def prepare_builder_context(self, context, mission):
@@ -159,6 +187,47 @@ class MirWorkerPool(WorkerPool):
             )
             context.robot_api_factory = factory
             context.robot_api = factory.build(mission.robot_id)
+
+    # @override
+    def translate_mission(self, mission: Mission) -> MirInOrbitMission:
+        """Compile consecutive waypoint steps into native MiR missions."""
+        self.logger.debug(f"Translating mission {mission.id}")
+        return InOrbitToMirTranslator.translate(
+            mission=mission,
+            spatial_transform=self._prefetched_transform,
+        )
+
+    # @override
+    def deserialize_mission(self, serialized_mission: dict) -> MirInOrbitMission:
+        """Deserialize mission using MiR-specific mission type."""
+        return MirInOrbitMission.model_validate(serialized_mission)
+
+    # @override
+    async def submit_work(self, mission, options, shared_memory=None):
+        """Pre-fetch SpatialTransformation before submitting work.
+
+        translate_mission() is called synchronously inside super().submit_work().
+        To avoid nested event loops, we fetch the transform here (async) and
+        store it for translate_mission() to use.
+        """
+        self._prefetched_transform = await self._maybe_fetch_transform(mission)
+        try:
+            return await super().submit_work(mission, options, shared_memory)
+        finally:
+            self._prefetched_transform = None
+
+    async def _maybe_fetch_transform(self, mission: Mission) -> Optional[SpatialTransform]:
+        """Fetch SpatialTransformation if any waypoint uses the shared 'map' frame."""
+        has_map_frame = any(
+            hasattr(step, "waypoint") and getattr(step.waypoint, "frame_id", None) == "map"
+            for step in mission.definition.steps
+        )
+        if not has_map_frame or not self._native_map_id:
+            return None
+
+        return await fetch_spatial_transform(
+            self._api, mission.robot_id, self._native_map_id,
+        )
 
     # @override
     async def pause_mission(self, mission_id):
@@ -200,7 +269,16 @@ class MirMissionExecutor:
     Handles mission submission, pause, resume, and abort operations.
     """
 
-    def __init__(self, robot_id, inorbit_api, mir_api, database_file=None):
+    def __init__(
+        self,
+        robot_id,
+        inorbit_api,
+        mir_api,
+        database_file=None,
+        missions_group: Optional[MirMissionsGroupHandler] = None,
+        firmware_version: str = "v3",
+        connector_type: str = "",
+    ):
         """
         Initialize the mission executor.
 
@@ -209,11 +287,17 @@ class MirMissionExecutor:
             inorbit_api: InOrbit API client instance
             mir_api: MIR robot API client instance
             database_file: Optional path to SQLite database file for mission storage
+            missions_group: Handler for temporary MiR missions group
+            firmware_version: MiR firmware version ("v2" or "v3")
+            connector_type: Connector type (e.g. "MiR100", "MiR250")
         """
         self.logger = logging.getLogger(name=self.__class__.__name__)
         self.robot_id = robot_id
         self.inorbit_api = inorbit_api
         self.mir_api = mir_api
+        self._missions_group = missions_group
+        self._firmware_version = firmware_version
+        self._connector_type = connector_type
         # Format database filename for inorbit-edge-executor
         # (expects "sqlite:<filename>" or "dummy")
         if database_file:
@@ -235,6 +319,9 @@ class MirMissionExecutor:
                 mir_api=self.mir_api,
                 api=self.inorbit_api,
                 db=db,
+                missions_group=self._missions_group,
+                firmware_version=self._firmware_version,
+                connector_type=self._connector_type,
             )
             await self._worker_pool.start()
             self._initialized = True
